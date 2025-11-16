@@ -5,7 +5,7 @@ import pandas as pd
 
 # ensure repo root is on sys.path so 'src' package is importable during tests
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.session_analysis import extract_sessions_from_df, extract_sessions, visualize_session_features, summary_stats
+from src.session_analysis import extract_sessions_from_df, extract_sessions, visualize_session_features, summary_stats, create_session_features, apply_onehot_encoding
 
 
 def _make_sample_events_csv(path):
@@ -30,6 +30,8 @@ def test_extract_sessions_from_df():
     ]
     df = pd.DataFrame(data)
     df["created_at"] = pd.to_datetime(df["created_at"])
+    
+    # Test without encoding
     sessions = extract_sessions_from_df(df)
     assert len(sessions) == 2
     # num_purchase and num_events are removed to avoid label leakage; assert converted label exists instead
@@ -41,20 +43,34 @@ def test_extract_sessions_from_df():
     assert bool(s1["converted"]) is True
     s2 = sessions[sessions["session_id"] == "s2"].iloc[0]
     assert bool(s2["converted"]) is False
+    
+    # Test with one-hot encoding via create_session_features
+    sessions_encoded = create_session_features(events_df=df, apply_encoding=True)
+    assert len(sessions_encoded) == 2
+    # Check one-hot encoded columns exist
+    assert any(col.startswith("browser_") for col in sessions_encoded.columns)
+    assert any(col.startswith("traffic_source_") for col in sessions_encoded.columns)
+    # Original categorical columns should be removed
+    assert "browser" not in sessions_encoded.columns
+    assert "traffic_source" not in sessions_encoded.columns
 
 
 def test_extract_sessions_cli_and_visualize(tmp_path):
     # create a small events csv
     events_csv = tmp_path / "events_small.csv"
     _make_sample_events_csv(events_csv)
-    # run extract_sessions on file
-    sessions = extract_sessions(str(events_csv), chunksize=2)
+    # run extract_sessions with one-hot encoding via create_session_features
+    sessions = create_session_features(events_path=str(events_csv), chunksize=2, apply_encoding=True)
     assert "session_id" in sessions.columns
     assert len(sessions) == 2
+    # Check one-hot encoding applied
+    assert any(col.startswith("browser_") for col in sessions.columns)
+    assert any(col.startswith("traffic_source_") for col in sessions.columns)
+    
     out_fig_dir = tmp_path / "figures"
     visualize_session_features(sessions, out_dir=str(out_fig_dir))
-    # ensure main figures exist
-    expected = ["session_funnel.png", "session_duration_log_hist.png", "feature_correlation_heatmap.png", "session_summary.png"]
+    # ensure main figures exist (session_funnel removed as num_* columns are excluded)
+    expected = ["session_duration_log_hist.png", "feature_correlation_heatmap.png", "session_summary.png"]
     found = [p.name for p in out_fig_dir.iterdir()]
     for fname in expected:
         assert fname in found
@@ -69,9 +85,9 @@ def test_extract_sessions_cli_and_visualize(tmp_path):
 def test_run_pycaret_automl_validation(tmp_path):
     events_csv = tmp_path / "events_small.csv"
     _make_sample_events_csv(events_csv)
-    # small sessions
-    from src.session_analysis import extract_sessions, run_pycaret_automl
-    sessions = extract_sessions(str(events_csv), chunksize=2)
+    # small sessions with one-hot encoding
+    from src.session_analysis import run_pycaret_automl
+    sessions = create_session_features(events_path=str(events_csv), chunksize=2, apply_encoding=True)
     out_dir = tmp_path / "pycaret_test"
     os.makedirs(out_dir, exist_ok=True)
     run_pycaret_automl(sessions, label="converted", sample_frac=1.0, target_dir=str(out_dir), train_size=0.8)
@@ -80,29 +96,12 @@ def test_run_pycaret_automl_validation(tmp_path):
     assert val_metrics.exists()
 
 
-def test_run_pycaret_automl_drop_leaky(tmp_path):
-    # build a sessions df where a synthetic 'leaker' feature equals the label
-    from src.session_analysis import run_pycaret_automl
-    events_csv = tmp_path / "events_small.csv"
-    _make_sample_events_csv(events_csv)
-    sessions = extract_sessions(str(events_csv), chunksize=2)
-    # create a synthetic leaky feature
-    sessions["leaker"] = sessions["converted"].astype(int)
-    out_dir = tmp_path / "pycaret_drop"
-    os.makedirs(out_dir, exist_ok=True)
-    # run with drop_leaky_features, which should remove 'leaker'
-    run_pycaret_automl(sessions, label="converted", sample_frac=1.0, target_dir=str(out_dir), train_size=0.8, drop_leaky_features=True)
-    dropped = out_dir / "leakage" / "dropped_leaky_features.json"
-    assert dropped.exists()
-    import json
-    d = json.loads(dropped.read_text())
-    dropped_list = d.get("dropped", [])
-    assert len(dropped_list) > 0
+
 
 
 def test_train_validation_disjoint():
     # ensure that train and validation sets from the run split are disjoint (no session overlap)
-    sessions = extract_sessions("dataset/events.csv", chunksize=2000, max_rows=2000)
+    sessions = create_session_features(events_path="dataset/events.csv", chunksize=2000, max_rows=2000, apply_encoding=True)
     df = sessions.copy()
     # make label int
     if df["converted"].dtype == bool:
@@ -120,9 +119,9 @@ def test_num_purchase_excluded_from_validation(tmp_path):
     # Ensure num_purchase is removed before training/evaluation and not included in validation set
     events_csv = tmp_path / "events_small.csv"
     _make_sample_events_csv(events_csv)
-    from src.session_analysis import extract_sessions, run_pycaret_automl
+    from src.session_analysis import run_pycaret_automl
 
-    sessions = extract_sessions(str(events_csv), chunksize=2)
+    sessions = create_session_features(events_path=str(events_csv), chunksize=2, apply_encoding=True)
     out_dir = tmp_path / "pycaret_test"
     out_dir.mkdir()
     run_pycaret_automl(sessions, label="converted", sample_frac=1.0, target_dir=str(out_dir), train_size=0.8)

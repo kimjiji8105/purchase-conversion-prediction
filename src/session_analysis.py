@@ -26,14 +26,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-def parse_bool(x: Any) -> bool:
-    if pd.isna(x):
-        return False
-    if isinstance(x, bool):
-        return x
-    return str(x).lower() in {"1", "true", "t", "y", "yes"}
-
-
 def _init_session_entry(session_id: str, row: pd.Series) -> Dict[str, Any]:
     return {
         "session_id": session_id,
@@ -80,204 +72,397 @@ def _finalize_session_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def create_session_features(events_df: pd.DataFrame = None, events_path: str = None, chunksize: int = 100000, max_rows: Optional[int] = None) -> pd.DataFrame:
+# ==============================================================================
+# DATA PIPELINE: Event Processing → Session Aggregation → Feature Engineering
+# ==============================================================================
+
+def _process_event_row(row: pd.Series, sessions: Dict[str, Dict[str, Any]]) -> None:
     """
-    Wrapper that builds session features. Provide either an in-memory `events_df`
-    or a path `events_path` to read in chunks. This keeps preprocessing centralized.
+    Process a single event row and update the sessions dictionary.
+    This consolidates the duplicate row-processing logic.
     """
-    if events_df is not None:
-        return extract_sessions_from_df(events_df)
-    if events_path is not None:
-        return extract_sessions(events_path, chunksize=chunksize, max_rows=max_rows)
-    raise ValueError("Either events_df or events_path must be provided to create_session_features")
+    session_id = row["session_id"]
+    if pd.isna(session_id):
+        return
+    
+    session_id = str(session_id)
+    if session_id not in sessions:
+        sessions[session_id] = _init_session_entry(session_id, row)
+    
+    entry = sessions[session_id]
+    
+    # Update user_id (prefer first non-null)
+    if entry["user_id"] is None and not pd.isna(row.get("user_id")):
+        entry["user_id"] = row.get("user_id")
+    
+    # Update time range
+    if row["created_at"] < entry["min_time"]:
+        entry["min_time"] = row["created_at"]
+    if row["created_at"] > entry["max_time"]:
+        entry["max_time"] = row["created_at"]
+    
+    # Update event counts
+    entry["num_events"] += 1
+    event_type = row.get("event_type") or "unknown"
+    entry["event_counts"][event_type] += 1
+    
+    # Track unique URIs
+    if not pd.isna(row.get("uri")):
+        entry["unique_uris"].add(row.get("uri"))
+    
+    # Update session attributes (keep first non-null)
+    for col in ("browser", "traffic_source", "city", "state"):
+        if entry.get(col) is None and not pd.isna(row.get(col)):
+            entry[col] = row.get(col)
+
+
+def _merge_user_demographics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge user demographic data (age, gender, country) from users.csv.
+    This consolidates duplicate user merge logic.
+    """
+    try:
+        users_path = os.path.join("dataset", "users.csv")
+        if not os.path.exists(users_path):
+            return df
+        
+        users_df = pd.read_csv(users_path)
+        users_df["user_id"] = pd.to_numeric(users_df["user_id"], errors="coerce")
+        df["user_id"] = pd.to_numeric(df["user_id"], errors="coerce")
+        
+        # Only keep safe demographic columns (no membership flags)
+        users_keep = [c for c in ("user_id", "age", "gender", "country") if c in users_df.columns]
+        if len(users_keep) > 1:
+            df = df.merge(users_df[users_keep], on="user_id", how="left")
+    except Exception:
+        pass
+    
+    return df
+
+
+def _apply_label_leakage_protection(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove features that could leak label information.
+    - Creates 'converted' label from num_purchase (before removal)
+    - Removes all num_* count columns to prevent leakage
+    """
+    # Define converted label (must be done before dropping num_purchase)
+    if "num_purchase" in df.columns:
+        df["converted"] = df["num_purchase"] > 0
+    else:
+        df["converted"] = False
+    
+    # Remove all raw count columns to avoid label leakage
+    num_cols = [c for c in df.columns if c.startswith("num_")]
+    if num_cols:
+        df = df.drop(columns=num_cols)
+    
+    return df
+
+
+def apply_onehot_encoding(df: pd.DataFrame, categorical_cols: list = None, drop_first: bool = False) -> pd.DataFrame:
+    """
+    PIPELINE STAGE: Apply one-hot encoding to categorical features.
+    
+    This ensures all downstream operations (visualization, modeling, SHAP) work with
+    consistently encoded data.
+    
+    Args:
+        df: DataFrame with categorical columns
+        categorical_cols: List of columns to encode. If None, auto-detect object/category dtypes
+        drop_first: Whether to drop first dummy variable (for linear models to avoid multicollinearity)
+    
+    Returns:
+        DataFrame with one-hot encoded categorical features
+    """
+    df = df.copy()
+    
+    # Auto-detect categorical columns if not specified
+    if categorical_cols is None:
+        categorical_cols = [
+            col for col in df.columns 
+            if col != 'converted' and (
+                pd.api.types.is_object_dtype(df[col]) or 
+                pd.api.types.is_categorical_dtype(df[col])
+            )
+        ]
+    
+    # Filter to only existing columns
+    categorical_cols = [col for col in categorical_cols if col in df.columns]
+    
+    if not categorical_cols:
+        return df
+    
+    # Apply one-hot encoding
+    df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=drop_first, dtype=int)
+    
+    return df_encoded
 
 
 def extract_sessions_from_df(events_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert an events DataFrame into a session-level DataFrame with aggregated features.
-
-    Events DataFrame must contain at least: session_id, created_at, event_type, uri
-    and optionally: user_id, browser, traffic_source, city, state
+    PIPELINE STAGE 1: Convert events DataFrame to session-level features.
+    
+    Input: events DataFrame with columns: session_id, created_at, event_type, uri
+           (optional: user_id, browser, traffic_source, city, state)
+    Output: Session-level DataFrame with aggregated features and 'converted' label
+    
+    Pipeline:
+    1. Normalize timestamps
+    2. Aggregate events by session
+    3. Merge user demographics
+    4. Create label and remove leaking features
     """
     sessions: Dict[str, Dict[str, Any]] = {}
 
-    # Ensure created_at is a datetime
+    # Normalize timestamps
     if not pd.api.types.is_datetime64_any_dtype(events_df["created_at"]):
         events_df["created_at"] = pd.to_datetime(
-            events_df["created_at"], utc=True, infer_datetime_format=True, errors="coerce"
+            events_df["created_at"], utc=True, errors="coerce"
         )
 
-    # Sort by session_id and created_at for consistent min/max
-    events_df = events_df.sort_values(["session_id", "created_at"])  # stable ordering
+    # Sort for consistent aggregation
+    events_df = events_df.sort_values(["session_id", "created_at"])
 
+    # Aggregate events into sessions
     for _, row in events_df.iterrows():
-        session_id = row["session_id"]
-        if pd.isna(session_id):
-            # skip rows without session id
-            continue
-        if session_id not in sessions:
-            sessions[session_id] = _init_session_entry(session_id, row)
-        entry = sessions[session_id]
-        # user_id prefer first non-null
-        if entry["user_id"] is None and not pd.isna(row.get("user_id")):
-            entry["user_id"] = row.get("user_id")
-        # min/max time
-        if row["created_at"] < entry["min_time"]:
-            entry["min_time"] = row["created_at"]
-        if row["created_at"] > entry["max_time"]:
-            entry["max_time"] = row["created_at"]
-        # counts
-        entry["num_events"] += 1
-        event_type = row.get("event_type") or "unknown"
-        entry["event_counts"][event_type] += 1
-        # uri
-        if not pd.isna(row.get("uri")):
-            entry["unique_uris"].add(row.get("uri"))
-        # browser/traffic/city/state: keep first non-null
-        for col in ("browser", "traffic_source", "city", "state"):
-            if entry.get(col) is None and not pd.isna(row.get(col)):
-                entry[col] = row.get(col)
+        _process_event_row(row, sessions)
 
-    # Finalize into DataFrame
-    data = []
-    for _, entry in sessions.items():
-        data.append(_finalize_session_entry(entry))
+    # Convert to DataFrame
+    data = [_finalize_session_entry(entry) for entry in sessions.values()]
     df = pd.DataFrame(data)
 
-    # Define converted label (based on purchase events internally tracked)
-    df["converted"] = df["num_purchase"] > 0
-    # Merge user demographic info (age, gender, country) when available
-    try:
-        users_path = os.path.join("dataset", "users.csv")
-        if os.path.exists(users_path):
-            users_df = pd.read_csv(users_path)
-            # normalize user_id types
-            users_df["user_id"] = pd.to_numeric(users_df["user_id"], errors="coerce")
-            df["user_id"] = pd.to_numeric(df["user_id"], errors="coerce")
-            users_keep = [c for c in ("user_id", "age", "gender", "country") if c in users_df.columns]
-            if len(users_keep) > 1:
-                df = df.merge(users_df[users_keep], on="user_id", how="left")
-    except Exception:
-        pass
-    # Note: do not add an explicit is_member flag here to avoid label-leaking features
-    # Remove all raw count columns (any column starting with 'num_') to avoid label leakage
-    num_cols = [c for c in df.columns if c.startswith("num_")]
-    if num_cols:
-        df = df.drop(columns=num_cols)
+    # Enrich with user demographics
+    df = _merge_user_demographics(df)
+    
+    # Apply label leakage protection
+    df = _apply_label_leakage_protection(df)
+    
     return df
 
 
 def extract_sessions(events_path: str, chunksize: int = 100000, max_rows: Optional[int] = None) -> pd.DataFrame:
     """
-    Process events.csv in chunks and extract session-level features.
-
-    Returns a DataFrame where each row is a session with aggregated features.
+    PIPELINE STAGE 1: Process events.csv in chunks and extract session-level features.
+    
+    This is a memory-efficient version of extract_sessions_from_df that processes
+    large files in chunks.
+    
+    Pipeline:
+    1. Read events in chunks
+    2. Aggregate events by session (streaming)
+    3. Merge user demographics
+    4. Create label and remove leaking features
     """
     fields = [
-        "id",
-        "user_id",
-        "sequence_number",
-        "session_id",
-        "created_at",
-        "ip_address",
-        "city",
-        "state",
-        "postal_code",
-        "browser",
-        "traffic_source",
-        "uri",
-        "event_type",
+        "id", "user_id", "sequence_number", "session_id", "created_at",
+        "ip_address", "city", "state", "postal_code", "browser",
+        "traffic_source", "uri", "event_type",
     ]
 
-    # This function reads the CSV in chunks and aggregates into an in-memory dict.
     sessions: Dict[str, Dict[str, Any]] = {}
-
     read_rows = 0
+    
+    # Process chunks
     for chunk in pd.read_csv(events_path, usecols=fields, parse_dates=["created_at"], chunksize=chunksize):
-        # Optionally limit rows for quick runs
         if max_rows is not None and read_rows >= max_rows:
             break
-        # If chunk push beyond max_rows, trim
+        
         if max_rows is not None and read_rows + len(chunk) > max_rows:
             chunk = chunk.head(max_rows - read_rows)
         read_rows += len(chunk)
 
-        # iterate rows
-        # Ensure created_at dtype is datetime
+        # Normalize timestamps
         if not pd.api.types.is_datetime64_any_dtype(chunk["created_at"]):
             chunk["created_at"] = pd.to_datetime(
-                chunk["created_at"], utc=True, infer_datetime_format=True, errors="coerce"
+                chunk["created_at"], utc=True, errors="coerce"
             )
+        
+        # Aggregate events into sessions
         for _, row in chunk.iterrows():
-            session_id = row["session_id"]
-            if pd.isna(session_id):
-                continue
-            session_id = str(session_id)
-            if session_id not in sessions:
-                sessions[session_id] = _init_session_entry(session_id, row)
-            entry = sessions[session_id]
-            # user_id prefer first non-null
-            if entry["user_id"] is None and not pd.isna(row.get("user_id")):
-                entry["user_id"] = row.get("user_id")
-            # min/max time
-            if row["created_at"] < entry["min_time"]:
-                entry["min_time"] = row["created_at"]
-            if row["created_at"] > entry["max_time"]:
-                entry["max_time"] = row["created_at"]
-            # counts
-            entry["num_events"] += 1
-            event_type = row.get("event_type") or "unknown"
-            entry["event_counts"][event_type] += 1
-            # uri
-            if not pd.isna(row.get("uri")):
-                entry["unique_uris"].add(row.get("uri"))
-            # browser/traffic/city/state: keep first non-null
-            for col in ("browser", "traffic_source", "city", "state"):
-                if entry.get(col) is None and not pd.isna(row.get(col)):
-                    entry[col] = row.get(col)
+            _process_event_row(row, sessions)
 
-    # finalize
-    results = []
-    for _, entry in sessions.items():
-        results.append(_finalize_session_entry(entry))
-    df = pd.DataFrame(results)
-    df["converted"] = df["num_purchase"] > 0
-    # Merge user demographic info (age, gender, country) when available
-    try:
-        users_path = os.path.join("dataset", "users.csv")
-        if os.path.exists(users_path):
-            users_df = pd.read_csv(users_path)
-            users_df["user_id"] = pd.to_numeric(users_df["user_id"], errors="coerce")
-            df["user_id"] = pd.to_numeric(df["user_id"], errors="coerce")
-            users_keep = [c for c in ("user_id", "age", "gender", "country") if c in users_df.columns]
-            if len(users_keep) > 1:
-                df = df.merge(users_df[users_keep], on="user_id", how="left")
-    except Exception:
-        pass
-    # Do not create an explicit membership flag here to avoid label-leaking features
-    # Remove all raw count columns (any column starting with 'num_') to avoid label leakage
-    num_cols = [c for c in df.columns if c.startswith("num_")]
-    if num_cols:
-        df = df.drop(columns=num_cols)
+    # Convert to DataFrame
+    data = [_finalize_session_entry(entry) for entry in sessions.values()]
+    df = pd.DataFrame(data)
+    
+    # Enrich with user demographics
+    df = _merge_user_demographics(df)
+    
+    # Apply label leakage protection
+    df = _apply_label_leakage_protection(df)
+    
     return df
+
+
+def create_session_features(events_df: pd.DataFrame = None, events_path: str = None, chunksize: int = 100000, max_rows: Optional[int] = None, apply_encoding: bool = True) -> pd.DataFrame:
+    """
+    MAIN ENTRY POINT: Build session-level features from events.
+    
+    This is the recommended interface for feature extraction.
+    
+    Pipeline:
+    1. Extract session features from events
+    2. Merge user demographics
+    3. Create label and remove leaking features
+    4. Apply one-hot encoding to categorical features
+    
+    Args:
+        events_df: In-memory events DataFrame (for small datasets or testing)
+        events_path: Path to events.csv (for production, large datasets)
+        chunksize: Number of rows to process at once when reading from file
+        max_rows: Maximum rows to read (for quick testing)
+        apply_encoding: If True, apply one-hot encoding to categorical features (default: True)
+    
+    Returns:
+        Session-level DataFrame with features and 'converted' label (one-hot encoded if apply_encoding=True)
+    """
+    if events_df is not None:
+        df = extract_sessions_from_df(events_df)
+    elif events_path is not None:
+        df = extract_sessions(events_path, chunksize=chunksize, max_rows=max_rows)
+    else:
+        raise ValueError("Either events_df or events_path must be provided")
+    
+    # Apply one-hot encoding to categorical features
+    if apply_encoding:
+        df = apply_onehot_encoding(df, categorical_cols=['browser', 'traffic_source'])
+    
+    return df
+
+
+# ==============================================================================
+# VISUALIZATION: Session Feature Analysis
+# ==============================================================================
+
+def _plot_conversion_by_category(df: pd.DataFrame, cat_col: str, out_name: str, out_dir: str, top_n: int = 10, min_count: int = 20) -> None:
+    """Helper: Plot conversion rate by categorical feature with annotations.
+    
+    Works with both one-hot encoded and raw categorical data.
+    """
+    if "converted" not in df.columns:
+        return
+    
+    # Check if we have one-hot encoded columns (e.g., browser_Chrome, browser_Firefox)
+    onehot_cols = [col for col in df.columns if col.startswith(f"{cat_col}_")]
+    
+    if onehot_cols:
+        # Reconstruct categorical data from one-hot encoding for visualization
+        category_data = []
+        for idx in df.index:
+            found = False
+            for col in onehot_cols:
+                if df.loc[idx, col] == 1:
+                    category_data.append(col.replace(f"{cat_col}_", ""))
+                    found = True
+                    break
+            if not found:
+                # If no 1 found (e.g., drop_first=True case), infer the dropped category
+                category_data.append("Other")
+        
+        temp_df = df.copy()
+        temp_df[cat_col] = category_data
+        
+        agg = temp_df.groupby(cat_col)["converted"].agg(["mean", "count"]).reset_index()
+    elif cat_col in df.columns:
+        # Raw categorical column exists
+        agg = df.groupby(cat_col)["converted"].agg(["mean", "count"]).reset_index()
+    else:
+        return
+    
+    agg = agg[agg["count"] >= min_count].sort_values("mean", ascending=False)
+    
+    if agg.empty:
+        return
+    
+    top = agg.head(top_n).sort_values("mean")
+    
+    plt.figure(figsize=(10, max(4, 0.4 * len(top))))
+    ax = sns.barplot(x="mean", y=cat_col, data=top, palette="viridis")
+    
+    plt.xlabel("Conversion Rate", fontsize=12, fontweight='bold')
+    plt.ylabel(cat_col.replace("_", " ").title(), fontsize=12, fontweight='bold')
+    plt.title(f"Conversion Rate by {cat_col.replace('_', ' ').title()}\n(Top {top_n}, Min {min_count} sessions)", 
+              fontsize=14, fontweight='bold', pad=20)
+    
+    # Annotate bars with percentage and counts
+    max_val = top["mean"].max()
+    for i, (_, row) in enumerate(top.iterrows()):
+        ax.text(row["mean"] + max_val * 0.02, i, 
+                f"{row['mean']:.1%} (n={int(row['count']):,})", 
+                va="center", fontsize=10, fontweight='bold')
+    
+    ax.set_xlim(0, max_val * 1.15)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, out_name), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_session_duration_analysis(df_plot: pd.DataFrame, out_dir: str) -> None:
+    """Helper: Plot session duration distributions and comparisons."""
+    if "session_duration_seconds" not in df_plot.columns:
+        return
+    
+    # Add log-transformed column
+    df_plot["session_duration_log1p"] = np.log1p(df_plot["session_duration_seconds"].fillna(0).astype(float))
+    
+    durations = df_plot["session_duration_seconds"].fillna(0).astype(float)
+    durations_pos = durations[durations > 0]
+    
+    if len(durations_pos) == 0:
+        return
+    
+    # Clip at 99th percentile for cleaner visualization
+    cap = min(durations_pos.quantile(0.99), durations_pos.max())
+    x = durations_pos.clip(upper=cap)
+    
+    # 1. Distribution plot
+    plt.figure(figsize=(10, 5))
+    sns.histplot(x=np.log1p(x), bins=50, kde=True, color="#3498db", edgecolor='black', alpha=0.7)
+    plt.xlabel("log1p(Session Duration in Seconds)", fontsize=12, fontweight='bold')
+    plt.ylabel("Frequency", fontsize=12, fontweight='bold')
+    plt.title("Session Duration Distribution (Log-Transformed)\nClipped at 99th Percentile", 
+              fontsize=14, fontweight='bold', pad=20)
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "session_duration_log_hist.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Comparison by conversion status
+    if "converted" in df_plot.columns:
+        plt.figure(figsize=(8, 5))
+        sns.boxplot(x="converted", y="session_duration_log1p", data=df_plot, hue="converted",
+                   palette={False: "#e74c3c", True: "#2ecc71"}, legend=False)
+        plt.xlabel("Converted", fontsize=12, fontweight='bold')
+        plt.ylabel("log1p(Session Duration in Seconds)", fontsize=12, fontweight='bold')
+        plt.title("Session Duration by Conversion Status\n(Log-Transformed)", 
+                 fontsize=14, fontweight='bold', pad=20)
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "session_duration_by_conversion_box.png"), dpi=150, bbox_inches='tight')
+        plt.close()
 
 
 def visualize_session_features(features_df: pd.DataFrame, out_dir: str = "outputs/figures", sample_frac: float = 0.2, train_columns_path: Optional[str] = None) -> None:
     """
-    Create several readable visualizations for session features.
-    - funnels of stages (home->product->cart->purchase)
-    - session duration histogram/log distribution + boxplot
-    - events distribution by conversion (violin/kde)
-    - conversion by traffic_source and browser (top N) with counts annotated
-    - correlation heatmap of numeric features
-
-    Parameters
-    - features_df: DataFrame returned from extract_sessions
-    - out_dir: where to save figures
-    - sample_frac: fraction of sessions to sample for plots that might be slow when data is large
+    PIPELINE STAGE 2: Create comprehensive visualizations of session features.
+    
+    Generates:
+    - Conversion funnel (stacked bar chart)
+    - Session duration distributions
+    - Conversion rates by traffic source and browser
+    - Feature correlation heatmap
+    - Summary dashboard
+    
+    Args:
+        features_df: Session-level features from extract_sessions()
+        out_dir: Output directory for figures
+        sample_frac: Sampling fraction for large datasets (0-1)
+        train_columns_path: Optional path to train_columns.json to limit viz to trained features
     """
     os.makedirs(out_dir, exist_ok=True)
-    sns.set(style="whitegrid")
+    sns.set_style("whitegrid")
+    sns.set_palette("husl")
 
     df = features_df.copy()
     # If a train_columns_path is provided and exists, limit visualizations to features
@@ -297,6 +482,17 @@ def visualize_session_features(features_df: pd.DataFrame, out_dir: str = "output
                     if extra in df.columns and extra not in keep:
                         keep.append(extra)
                 df = df[keep].copy()
+                # If a train CSV exists next to train_columns.json, prefer using that
+                # dataset for numeric correlation calculation because it represents
+                # the exact data the model trained on (sampling, filtering, encoding
+                # aside). This helps show correlations as seen by the model.
+                train_csv = os.path.join(os.path.dirname(train_columns_path), "train.csv")
+                train_df_for_corr = None
+                if os.path.exists(train_csv):
+                    try:
+                        train_df_for_corr = pd.read_csv(train_csv)
+                    except Exception:
+                        train_df_for_corr = None
         except Exception:
             # if anything goes wrong reading train columns, fallback to full df
             df = features_df.copy()
@@ -315,126 +511,12 @@ def visualize_session_features(features_df: pd.DataFrame, out_dir: str = "output
     else:
         df_plot = df
 
-    # Funnel: compute conversion proportion for all event-type counts except purchase and cancel
-    # Find all event count columns which start with 'num_' and exclude purchase/cancel
-    count_cols = [c for c in df.columns if c.startswith("num_")]
-    exclude = {"num_purchase", "num_cancel"}
-    event_cols = [c for c in count_cols if c not in exclude]
-    # Build staged counts and stacked percentages of converted vs not
-    funnel_rows = []
-    total_sessions = len(df)
-    for col in event_cols:
-        name = col.replace("num_", "").replace("_", " ").title()
-        if col in df.columns:
-            stage_mask = df[col] > 0
-            stage_df = df[stage_mask]
-            total_stage = len(stage_df)
-            converted_count = int(stage_df[stage_df.get("converted", False) == True].shape[0])
-            not_converted = total_stage - converted_count
-        else:
-            total_stage = 0
-            converted_count = 0
-            not_converted = 0
-        funnel_rows.append({"stage": name, "total": total_stage, "converted": converted_count, "not_converted": not_converted})
-    funnel_df = pd.DataFrame(funnel_rows)
+    # Session duration analysis
+    _plot_session_duration_analysis(df_plot, out_dir)
 
-    # Create stacked horizontal bar plot showing conversion proportion per stage
-    funnel_available = not funnel_df.empty and funnel_df["total"].sum() > 0
-    if funnel_available:
-        plt.figure(figsize=(8, 4))
-        y = funnel_df["stage"].values
-        left = np.zeros(len(funnel_df))
-        colors = ["#B3CDE3", "#33A02C"]  # not_converted, converted
-        for i, col in enumerate(["not_converted", "converted"]):
-            vals = funnel_df[col].values
-            # convert to fraction of stage total to show proportion per stage
-            frac = np.divide(vals, funnel_df["total"].replace(0, np.nan)).astype(float)
-            frac = np.nan_to_num(frac, nan=0.0)
-            plt.barh(y, frac, left=left, color=colors[i], edgecolor="k", label=("Not converted" if col=="not_converted" else "Converted"))
-            left = left + frac
-        plt.xlabel("Fraction of sessions in stage")
-        plt.title("Conversion proportions by funnel stage (stacked)")
-        plt.legend(loc="lower right")
-        # annotate with counts and percent
-        for i, row in funnel_df.iterrows():
-            total = row["total"]
-            if total == 0:
-                continue
-            # annotate not converted
-            nc_frac = row["not_converted"] / total
-            c_frac = row["converted"] / total
-            # left edge
-            plt.text(nc_frac / 2, i, f"{row['not_converted']} ({nc_frac:.0%})", va="center", ha="center", fontsize=9, color="black")
-            # right edge
-            plt.text(nc_frac + c_frac / 2, i, f"{row['converted']} ({c_frac:.0%})", va="center", ha="center", fontsize=9, color="white")
-        plt.xlim(0, 1)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "session_funnel.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-    else:
-        # placeholder figure so callers/tests that expect a file still find something
-        plt.figure(figsize=(8, 3))
-        plt.text(0.5, 0.5, "No funnel data (event count columns removed)", ha="center", va="center")
-        plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "session_funnel.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-
-    # Prepare additional columns (log transforms) used in several plots
-    if "session_duration_seconds" in df.columns:
-        df_plot["session_duration_log1p"] = np.log1p(df_plot["session_duration_seconds"].fillna(0).astype(float))
-    if "session_duration_seconds" in df_plot.columns:
-        durations = df_plot["session_duration_seconds"].fillna(0).astype(float)
-        durations_pos = durations[durations > 0]
-        if len(durations_pos) > 0:
-            cap = min(durations_pos.quantile(0.99), durations_pos.max())
-            x = durations_pos.clip(upper=cap)
-            plt.figure(figsize=(8, 4))
-            sns.histplot(x=np.log1p(x), bins=40, kde=True, color="#5A9" )
-            plt.xlabel("log1p(Session duration seconds)")
-            plt.title("Session duration distribution (log1p) — clipped at 99th percentile")
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, "session_duration_log_hist.png"), dpi=150, bbox_inches='tight')
-            plt.close()
-
-            # boxplot of log1p(duration) by conversion for summary
-            if "converted" in df_plot.columns:
-                plt.figure(figsize=(6, 4))
-                sns.boxplot(x="converted", y="session_duration_log1p", data=df_plot, palette=sns.color_palette(["#B2DF8A", "#33A02C"]))
-                plt.xlabel("Converted")
-                plt.ylabel("log1p(Session duration seconds)")
-                plt.title("Session duration by conversion (log1p)")
-                plt.tight_layout()
-                plt.savefig(os.path.join(out_dir, "session_duration_by_conversion_box.png"), dpi=150, bbox_inches='tight')
-                plt.close()
-
-    # (Removed) num_events-based plots to avoid leaking label-derived information.
-
-    # Conversion rate by traffic_source and browser (top N categories for clarity)
-    def plot_top_categories(cat_col: str, out_name: str, top_n: int = 10, min_count: int = 20):
-        if cat_col not in df.columns:
-            return
-        agg = df.groupby(cat_col)["converted"].agg(["mean", "count"]).reset_index()
-        agg = agg[agg["count"] >= min_count].sort_values("mean", ascending=False)
-        if agg.empty:
-            return
-        top = agg.head(top_n).sort_values("mean")
-        plt.figure(figsize=(8, max(3, 0.4 * len(top))))
-        ax = sns.barplot(x="mean", y=cat_col, data=top, palette="crest")
-        plt.xlabel("Conversion rate")
-        plt.title(f"Conversion rate by {cat_col} (top {top_n}, min {min_count} sessions)")
-        # annotate percentage and counts
-        max_val = top["mean"].max()
-        for i, (_, row) in enumerate(top.iterrows()):
-            ax.text(row["mean"] + max_val * 0.01, i, f"{row['mean']:.1%} ({int(row['count'])})", va="center", fontsize=9)
-        ax.set_yticklabels(ax.get_yticklabels(), fontsize=9)
-        ax.set_xlim(0, max_val * 1.12)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, out_name), dpi=150, bbox_inches='tight')
-        plt.close()
-
-    plot_top_categories("traffic_source", "conversion_by_traffic_source.png")
-    plot_top_categories("browser", "conversion_by_browser.png")
+    # Conversion rate by categorical features
+    _plot_conversion_by_category(df, "traffic_source", "conversion_by_traffic_source.png", out_dir)
+    _plot_conversion_by_category(df, "browser", "conversion_by_browser.png", out_dir)
 
     # num_unique_uris by conversion
     if "num_unique_uris" in df_plot.columns and "converted" in df_plot.columns:
@@ -446,60 +528,45 @@ def visualize_session_features(features_df: pd.DataFrame, out_dir: str = "output
         plt.close()
 
     # Correlation heatmap of numeric features
-    numeric_cols = [c for c in df_plot.columns if pd.api.types.is_numeric_dtype(df_plot[c])]
-    numeric_cols = [c for c in numeric_cols if c not in ("id", "user_id")]
-    if len(numeric_cols) >= 2:
-        corr = df_plot[numeric_cols].corr()
-        plt.figure(figsize=(max(6, 0.6 * len(numeric_cols)), max(6, 0.6 * len(numeric_cols))))
-        sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", cbar_kws={"shrink": 0.5})
-        plt.title("Correlation matrix of numeric features")
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "feature_correlation_heatmap.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-
-    # Summary dashboard: 2x2 (funnel, duration, events by conversion, traffic source)
+    # If we loaded a train CSV (train_df_for_corr), prefer that for correlation
+    # since it reflects the exact data used for modeling. Otherwise fall back to
+    # the sampled df_plot.
+    corr_source = None
     try:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        # Funnel (top-left)
-        ax = axes[0, 0]
-        # Use the same stacked fraction representation as session_funnel for consistency
-        if funnel_available:
-            y = funnel_df["stage"].values
-            left_local = np.zeros(len(funnel_df))
-            for i, col in enumerate(["not_converted", "converted"]):
-                vals = funnel_df[col].values
-                frac = np.divide(vals, funnel_df["total"].replace(0, np.nan)).astype(float)
-                frac = np.nan_to_num(frac, nan=0.0)
-                ax.barh(y, frac, left=left_local, color=("#B3CDE3" if col == "not_converted" else "#33A02C"), edgecolor="k")
-                left_local = left_local + frac
-            ax.set_xlabel("Fraction of sessions in stage")
-            ax.set_title("Conversion proportions by funnel stage (stacked)")
-            # annotate with counts/percent per stage (same as session_funnel)
-            for i, row in funnel_df.iterrows():
-                total = row["total"]
-                if total == 0:
-                    continue
-                nc_frac = row["not_converted"] / total
-                c_frac = row["converted"] / total
-                ax.text(nc_frac / 2, i, f"{row['not_converted']} ({nc_frac:.0%})", va="center", ha="center", fontsize=9, color="black")
-                ax.text(nc_frac + c_frac / 2, i, f"{row['converted']} ({c_frac:.0%})", va="center", ha="center", fontsize=9, color="white")
+        if 'train_df_for_corr' in locals() and train_df_for_corr is not None:
+            corr_source = train_df_for_corr
         else:
-            ax.text(0.5, 0.5, "No funnel data (counts removed)", ha="center", va="center")
-            ax.axis('off')
+            corr_source = df_plot
+        numeric_cols = [c for c in corr_source.columns if pd.api.types.is_numeric_dtype(corr_source[c])]
+        numeric_cols = [c for c in numeric_cols if c not in ("id", "user_id")]
+        if len(numeric_cols) >= 2:
+            corr = corr_source[numeric_cols].corr()
+            plt.figure(figsize=(max(6, 0.6 * len(numeric_cols)), max(6, 0.6 * len(numeric_cols))))
+            sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", cbar_kws={"shrink": 0.5})
+            title = "Correlation matrix of numeric features"
+            if 'train_df_for_corr' in locals() and train_df_for_corr is not None:
+                title += " (model train set)"
+            plt.title(title)
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, "feature_correlation_heatmap.png"), dpi=150, bbox_inches='tight')
+            plt.close()
+    except Exception:
+        # If correlation plotting fails, continue without aborting visualizations
+        pass
 
-        # Duration (top-right)
-        ax = axes[0, 1]
+    # Summary dashboard: 2x1 (duration, traffic source)
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Duration (left)
+        ax = axes[0]
         if "session_duration_log1p" in df_plot.columns:
             sns.histplot(df_plot["session_duration_log1p"], bins=40, kde=True, ax=ax, color="#5A9")
             ax.set_xlabel("log1p(Session duration seconds)")
             ax.set_title("Session duration (log1p)")
 
-        # Events by conversion (bottom-left) - removed num_events-based plot to avoid label leakage
-        ax = axes[1, 0]
-        ax.set_visible(False)
-
-        # Traffic source conversion (bottom-right)
-        ax = axes[1, 1]
+        # Traffic source conversion (right)
+        ax = axes[1]
         if "traffic_source" in df.columns:
             agg = df.groupby("traffic_source")["converted"].agg(["mean", "count"]).reset_index()
             agg = agg[agg["count"] >= 20].sort_values("mean", ascending=False).head(8)
@@ -516,27 +583,111 @@ def visualize_session_features(features_df: pd.DataFrame, out_dir: str = "output
         pass
 
 
-def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", sample_frac: float = 0.2, target_dir: str = "outputs/pycaret", train_size: float = 0.8, drop_leaky_features: bool = False):
+# ==============================================================================
+# MODELING: AutoML Training Pipeline
+# ==============================================================================
+
+def _save_validation_metrics_and_plots(y_true, y_pred, y_proba, target_dir: str, subdir: str = "validation", 
+                                       metrics_filename: str = "validation_metrics.json", 
+                                       save_classification_report: bool = False):
+    """Helper: Save validation metrics, confusion matrix, ROC curve, and optionally classification report."""
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, roc_curve, auc, classification_report
+    import matplotlib.pyplot as plt
+    import json
+    
+    # Calculate metrics
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, y_proba)) if y_proba is not None else None,
+    }
+    
+    # Determine output directory
+    out_dir = os.path.join(target_dir, subdir) if subdir else target_dir
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Save metrics JSON
+    with open(os.path.join(out_dir, metrics_filename), "w") as f:
+        json.dump(metrics, f, indent=2)
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title("Confusion Matrix")
+    plt.tight_layout()
+    fig.savefig(os.path.join(out_dir, "confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+    
+    # ROC curve
+    if y_proba is not None:
+        fpr, tpr, _ = roc_curve(y_true, y_proba)
+        roc_auc = auc(fpr, tpr)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
+        ax.plot([0, 1], [0, 1], "k--")
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title("ROC Curve")
+        ax.legend()
+        plt.tight_layout()
+        fig.savefig(os.path.join(out_dir, "roc_curve.png"), dpi=150)
+        plt.close(fig)
+    
+    # Classification report
+    if save_classification_report:
+        with open(os.path.join(out_dir, "classification_report.txt"), "w") as f:
+            f.write(classification_report(y_true, y_pred))
+    
+    return metrics
+
+
+def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", sample_frac: float = 0.2, target_dir: str = "outputs/pycaret", train_size: float = 0.8):
     """
-    Run a small AutoML experiment using PyCaret for classification.
-    To keep runtime reasonable, sample a fraction of input if it's large.
+    PIPELINE STAGE 3: Train classification model using AutoML.
+    
+    Pipeline steps:
+    1. Remove label-leaking features (num_* columns)
+    2. Split into train/validation sets
+    3. Train model using PyCaret AutoML (or sklearn fallback)
+    4. Save model, training data, and evaluation metrics
+    
+    Args:
+        features_df: Session features with 'converted' label
+        label: Target column name (default: "converted")
+        sample_frac: Fraction to sample for faster training (0-1)
+        target_dir: Output directory for model and artifacts
+        train_size: Train split ratio (default: 0.8)
+    
+    Returns:
+        Trained model object
     """
+    pycaret_available = True
     try:
         from pycaret.classification import setup, compare_models, save_model, predict_model
     except Exception:
-        raise RuntimeError("PyCaret is not installed. Please install 'pycaret' to use the AutoML feature.")
+        # PyCaret not available in this environment — fall back to sklearn pipeline below.
+        pycaret_available = False
 
     os.makedirs(target_dir, exist_ok=True)
     df = features_df.copy()
+    
     # Permanently remove any 'num_' count columns from modeling to avoid unintended signal/label leakage
     num_cols = [c for c in df.columns if c.startswith("num_")]
     if num_cols:
         print(f"Removing count columns from features before modeling: {num_cols}")
         df = df.drop(columns=num_cols)
-    # select useful columns
-    cols = ["num_unique_uris", "session_duration_seconds", "browser", "traffic_source", label]
-    # keep only columns that exist
-    cols = [c for c in cols if c in df.columns]
+    
+    # Select useful columns (including one-hot encoded columns)
+    # Keep numeric features and all one-hot encoded categorical features
+    # Exclude IDs and datetime columns
+    exclude_cols = ['session_id', 'user_id', 'session_start', 'session_end', 'city', 'state']
+    feature_cols = [c for c in df.columns if c != label and c not in exclude_cols]
+    cols = feature_cols + [label]
     df = df[cols].dropna(subset=[label])
 
     if 0 < sample_frac < 1.0 and len(df) > 1000:
@@ -556,21 +707,6 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
     except Exception:
         pass
 
-    # optionally detect and drop leakage-prone features
-    if drop_leaky_features:
-        try:
-            leak_report = detect_label_leakage(df, label=label)
-            flagged = [f["feature"] for f in leak_report.get("flagged", [])]
-            if flagged:
-                print(f"Dropping potentially leaky features before training: {flagged}")
-                df = df.drop(columns=flagged, errors="ignore")
-                os.makedirs(os.path.join(target_dir, "leakage"), exist_ok=True)
-                import json
-                with open(os.path.join(target_dir, "leakage", "dropped_leaky_features.json"), "w") as f:
-                    json.dump({"dropped": flagged}, f, indent=2)
-        except Exception:
-            pass
-
     # split into train / validation explicitly using sklearn and run AutoML on train set
     from sklearn.model_selection import train_test_split
     stratify_col = None
@@ -579,23 +715,22 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
         if val_counts.min() >= 2:
             stratify_col = df[label]
     train_df, val_df = train_test_split(df, train_size=train_size, stratify=stratify_col, random_state=42)
-    # Save explicit train/validation CSVs used for modeling (raw dataframes)
+    # Save explicit train/validation CSVs used for modeling
     try:
         os.makedirs(target_dir, exist_ok=True)
         train_path = os.path.join(target_dir, "train.csv")
         val_dir = os.path.join(target_dir, "validation")
         os.makedirs(val_dir, exist_ok=True)
         train_df.to_csv(train_path, index=False)
-        # save raw validation set
-        val_df.to_csv(os.path.join(val_dir, "validation_set_raw.csv"), index=False)
-        # also save a canonical validation_set.csv (may be overwritten later with encoded version)
         val_df.to_csv(os.path.join(val_dir, "validation_set.csv"), index=False)
     except Exception:
         pass
     # PyCaret setup uses train set only
     # For tiny datasets, PyCaret may not behave well — fallback to a simple sklearn pipeline
     use_sklearn_fallback = len(train_df) < 10 or len(val_df) < 2
-    if not use_sklearn_fallback:
+    if pycaret_available and not use_sklearn_fallback:
+        # Since data is already one-hot encoded, we tell PyCaret not to re-encode
+        # by treating all columns as numeric (which they are after one-hot encoding)
         clf_setup = setup(
             data=train_df,
             target=label,
@@ -605,6 +740,8 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
             verbose=False,
             html=False,
             n_jobs=-1,
+            categorical_features=[],  # All features already encoded as numeric
+            numeric_features=[c for c in train_df.columns if c != label],
         )
         # compare_models prints a leaderboard to stdout; capture it to avoid duplicate
         # printing in the CLI logs
@@ -631,10 +768,11 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
         X_train = train_df.drop(columns=[label]) if label in train_df.columns else train_df
         y_train = train_df[label].astype(int) if label in train_df.columns else None
         X_val = val_df.drop(columns=[label]) if label in val_df.columns else val_df
-        # basic encoding for small dataset: get dummies and align
-        X_train_enc = pd.get_dummies(X_train)
-        X_val_enc = pd.get_dummies(X_val)
-        # align columns
+        
+        # Data is already one-hot encoded, just ensure alignment
+        X_train_enc = X_train.copy()
+        X_val_enc = X_val.copy()
+        # align columns (in case of any mismatch)
         X_train_enc, X_val_enc = X_train_enc.align(X_val_enc, join='left', axis=1, fill_value=0)
         # If y_train has only a single class, fallback to DummyClassifier to avoid errors
         from sklearn.dummy import DummyClassifier
@@ -645,14 +783,7 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
         pipeline.fit(X_train_enc, y_train)
         import joblib
         joblib.dump(pipeline, os.path.join(target_dir, "best_pycaret_model.pkl"))
-        # Save the aligned val set as we will use it for evaluation
-        try:
-            os.makedirs(os.path.join(target_dir, "validation"), exist_ok=True)
-            X_val_enc.to_csv(os.path.join(target_dir, "validation", "validation_set.csv"), index=False)
-            # also save original val_df for downstream
-            val_df.to_csv(os.path.join(target_dir, "validation", "validation_set_raw.csv"), index=False)
-        except Exception:
-            pass
+        # Note: validation_set.csv already saved above with full validation data
         best = pipeline
         # Evaluate on validation set for sklearn fallback and save validation metrics
         try:
@@ -664,43 +795,7 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
                     y_proba = pipeline.predict_proba(X_val_enc)[:, 1]
                 except Exception:
                     y_proba = None
-            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
-            metrics = {
-                "accuracy": float(accuracy_score(y_true, y_pred)),
-                "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-                "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-                "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-                "roc_auc": float(roc_auc_score(y_true, y_proba)) if y_proba is not None else None,
-            }
-            os.makedirs(os.path.join(target_dir, "validation"), exist_ok=True)
-            import json
-            with open(os.path.join(target_dir, "validation", "validation_metrics.json"), "w") as f:
-                json.dump(metrics, f, indent=2)
-            # confusion matrix
-            cm = confusion_matrix(y_true, y_pred)
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(figsize=(5, 4))
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-            ax.set_xlabel("Predicted")
-            ax.set_ylabel("Actual")
-            ax.set_title("Validation Confusion Matrix")
-            plt.tight_layout()
-            fig.savefig(os.path.join(target_dir, "validation", "confusion_matrix.png"), dpi=150)
-            plt.close(fig)
-            if y_proba is not None:
-                from sklearn.metrics import roc_curve, auc
-                fpr, tpr, _ = roc_curve(y_true, y_proba)
-                roc_auc = auc(fpr, tpr)
-                fig, ax = plt.subplots(figsize=(5, 4))
-                ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
-                ax.plot([0, 1], [0, 1], "k--")
-                ax.set_xlabel("False Positive Rate")
-                ax.set_ylabel("True Positive Rate")
-                ax.set_title("Validation ROC Curve")
-                ax.legend()
-                plt.tight_layout()
-                fig.savefig(os.path.join(target_dir, "validation", "roc_curve.png"), dpi=150)
-                plt.close(fig)
+            _save_validation_metrics_and_plots(y_true, y_pred, y_proba, target_dir)
         except Exception:
             pass
     # save a model
@@ -712,9 +807,6 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
     # Evaluate on validation set and save validation metrics (only validation results saved)
     try:
         pred = predict_model(best, data=val_df)
-        # write out validation metrics using the evaluate helper for consistency
-        os.makedirs(os.path.join(target_dir, "validation"), exist_ok=True)
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
         y_true = val_df[label].astype(int)
         # detect predicted label column
         if "Label" in pred.columns:
@@ -725,52 +817,7 @@ def run_pycaret_automl(features_df: pd.DataFrame, label: str = "converted", samp
             y_pred = pred.iloc[:, -1].astype(int)
         prob_cols = [c for c in pred.columns if c.lower().startswith("score") or c.lower().startswith("prob") or c == "Score"]
         y_proba = pred[prob_cols[0]] if prob_cols else None
-        metrics = {}
-        metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
-        metrics["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
-        metrics["recall"] = float(recall_score(y_true, y_pred, zero_division=0))
-        metrics["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
-        if y_proba is not None:
-            try:
-                metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba))
-            except Exception:
-                metrics["roc_auc"] = None
-        else:
-            metrics["roc_auc"] = None
-        import json
-        # Save a copy of validation set used
-        try:
-            os.makedirs(os.path.join(target_dir, "validation"), exist_ok=True)
-            val_df.to_csv(os.path.join(target_dir, "validation", "validation_set.csv"), index=False)
-        except Exception:
-            pass
-        with open(os.path.join(target_dir, "validation", "validation_metrics.json"), "w") as f:
-            json.dump(metrics, f, indent=2)
-        # Save confusion matrix and ROC if prob exists
-        cm = confusion_matrix(y_true, y_pred)
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(5, 4))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("Actual")
-        ax.set_title("Validation Confusion Matrix")
-        plt.tight_layout()
-        fig.savefig(os.path.join(target_dir, "validation", "confusion_matrix.png"), dpi=150)
-        plt.close(fig)
-        if y_proba is not None:
-            from sklearn.metrics import roc_curve, auc
-            fpr, tpr, _ = roc_curve(y_true, y_proba)
-            roc_auc = auc(fpr, tpr)
-            fig, ax = plt.subplots(figsize=(5, 4))
-            ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
-            ax.plot([0, 1], [0, 1], "k--")
-            ax.set_xlabel("False Positive Rate")
-            ax.set_ylabel("True Positive Rate")
-            ax.set_title("Validation ROC Curve")
-            ax.legend()
-            plt.tight_layout()
-            fig.savefig(os.path.join(target_dir, "validation", "roc_curve.png"), dpi=150)
-            plt.close(fig)
+        _save_validation_metrics_and_plots(y_true, y_pred, y_proba, target_dir)
     except Exception:
         pass
     return best
@@ -817,58 +864,12 @@ def evaluate_pycaret_model(model_path: str, features_df: pd.DataFrame = None, va
     prob_cols = [c for c in pred.columns if c.lower().startswith("score") or c.lower().startswith("prob") or c == "Score"]
     y_proba = pred[prob_cols[0]] if prob_cols else None
 
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
-    metrics = {}
-    metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
-    metrics["precision"] = float(precision_score(y_true, y_pred, zero_division=0))
-    metrics["recall"] = float(recall_score(y_true, y_pred, zero_division=0))
-    metrics["f1"] = float(f1_score(y_true, y_pred, zero_division=0))
-    if y_proba is not None:
-        try:
-            metrics["roc_auc"] = float(roc_auc_score(y_true, y_proba))
-        except Exception:
-            metrics["roc_auc"] = None
-    else:
-        metrics["roc_auc"] = None
-
-    # Save metrics
-    import json
-    with open(os.path.join(target_dir, "evaluation_metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    ax.set_title("Confusion Matrix")
-    plt.tight_layout()
-    fig.savefig(os.path.join(target_dir, "confusion_matrix.png"), dpi=150)
-    plt.close(fig)
-
-    # ROC curve
-    if y_proba is not None:
-        from sklearn.metrics import roc_curve, auc
-        fpr, tpr, _ = roc_curve(y_true, y_proba)
-        roc_auc = auc(fpr, tpr)
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
-        ax.plot([0, 1], [0, 1], "k--")
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
-        ax.set_title("ROC Curve")
-        ax.legend()
-        plt.tight_layout()
-        fig.savefig(os.path.join(target_dir, "roc_curve.png"), dpi=150)
-        plt.close(fig)
-
-    # Save classification report
-    from sklearn.metrics import classification_report
-    with open(os.path.join(target_dir, "classification_report.txt"), "w") as f:
-        f.write(classification_report(y_true, y_pred))
-
+    metrics = _save_validation_metrics_and_plots(
+        y_true, y_pred, y_proba, target_dir, 
+        subdir=None,  # Save directly in target_dir
+        metrics_filename="evaluation_metrics.json",
+        save_classification_report=True
+    )
     return metrics
 
 
@@ -877,12 +878,20 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
     Compute feature importances using coefficient-based approach (if linear) and SHAP if available.
     """
     os.makedirs(target_dir, exist_ok=True)
+    
+    # Try PyCaret first, fallback to joblib
+    model = None
     try:
         from pycaret.classification import load_model
+        model = load_model(model_path)
     except Exception:
-        raise RuntimeError("PyCaret is not available for feature importance analysis.")
-
-    model = load_model(model_path)
+        # Try loading with joblib (for sklearn pipelines saved directly)
+        try:
+            import joblib
+            pkl_path = model_path if model_path.endswith('.pkl') else model_path + '.pkl'
+            model = joblib.load(pkl_path)
+        except Exception as e:
+            raise RuntimeError(f"Could not load model from {model_path}: {e}")
 
     # get sample from provided validation set if available, otherwise use features_df
     if val_df is not None:
@@ -901,7 +910,23 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
             # keep only columns that exist in X
             keep = [c for c in train_cols if c in X.columns]
             if keep:
-                X = X[keep]
+                # Prefer using the original train.csv if present so SHAP uses the exact
+                # data the model trained on (sampling/filters aside). Otherwise fall
+                # back to the provided features/val set limited to train columns.
+                train_csv = os.path.join(os.path.dirname(train_cols_path), "train.csv")
+                try:
+                    if os.path.exists(train_csv):
+                        train_df = pd.read_csv(train_csv)
+                        # keep train columns that exist in train_df
+                        train_keep = [c for c in train_cols if c in train_df.columns]
+                        if train_keep:
+                            X = train_df[train_keep].copy()
+                        else:
+                            X = X[keep]
+                    else:
+                        X = X[keep]
+                except Exception:
+                    X = X[keep]
     except Exception:
         pass
     if len(X) > sample_size:
@@ -917,11 +942,25 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
         if isinstance(model, Pipeline) and len(model.steps) > 1:
             preprocessor = Pipeline(model.steps[:-1])
             estimator = model.steps[-1][1]
+            # let the pipeline preprocessor handle categorical encoding/transform
             Xs_proc = preprocessor.transform(Xs)
         else:
-            # direct estimator
+            # direct estimator: ensure Xs_proc is numeric (encode categoricals)
             estimator = model
-            Xs_proc = Xs.values
+            Xs_proc_df = Xs.copy()
+            cat_cols = [c for c in Xs_proc_df.columns if pd.api.types.is_object_dtype(Xs_proc_df[c]) or pd.api.types.is_categorical_dtype(Xs_proc_df[c])]
+            if len(cat_cols) > 0:
+                try:
+                    Xs_proc_df = pd.get_dummies(Xs_proc_df, columns=cat_cols, drop_first=False)
+                except Exception:
+                    # fallback: convert categoricals to codes
+                    for c in cat_cols:
+                        Xs_proc_df[c] = Xs_proc_df[c].astype('category').cat.codes
+            # final numeric array for explainer
+            try:
+                Xs_proc = Xs_proc_df.values
+            except Exception:
+                Xs_proc = np.asarray(Xs_proc_df)
 
         # choose appropriate explainer
         if hasattr(estimator, "coef_"):
@@ -952,8 +991,13 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
                     feature_names = preprocessor.get_feature_names_out(Xs.columns)
             except Exception:
                 feature_names = None
-            if feature_names is None and hasattr(Xs, 'columns'):
-                feature_names = list(Xs.columns)
+            if feature_names is None:
+                # if we used a DataFrame and didn't let preprocessor handle encoding,
+                # try to infer names from Xs (after get_dummies) or Xs_proc_df
+                if 'Xs_proc_df' in locals() and hasattr(Xs_proc_df, 'columns'):
+                    feature_names = list(Xs_proc_df.columns)
+                elif hasattr(Xs, 'columns'):
+                    feature_names = list(Xs.columns)
 
             use_names = None
             if feature_names is not None and hasattr(Xs_proc, 'shape') and len(feature_names) == Xs_proc.shape[1]:
@@ -970,30 +1014,38 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
                 else:
                     n_plots = 1
 
+                # Calculate dynamic height based on number of features
+                n_features = Xs_proc.shape[1] if hasattr(Xs_proc, 'shape') else len(use_names) if use_names else 10
+                fig_height = max(6, n_features * 0.4)  # At least 6 inches, 0.4 inch per feature
+                
                 if n_plots == 1:
-                    plt.figure(figsize=(10, 6))
-                    shap.summary_plot(shap_values, Xs_proc, feature_names=use_names, show=False)
-                    plt.savefig(os.path.join(target_dir, "shap_summary.png"), bbox_inches='tight', dpi=150)
+                    plt.figure(figsize=(12, fig_height))
+                    shap.summary_plot(shap_values, Xs_proc, feature_names=use_names, show=False, max_display=20)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(target_dir, "shap_summary.png"), bbox_inches='tight', dpi=150, pad_inches=0.5)
                     plt.close()
                 else:
-                    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 6))
+                    fig, axes = plt.subplots(1, n_plots, figsize=(8 * n_plots, fig_height))
                     if n_plots == 1:
                         axes = [axes]
                     for i in range(n_plots):
                         ax = axes[i]
                         plt.sca(ax)
                         vals = shap_values[i] if isinstance(shap_values, (list, tuple)) else shap_values[i]
-                        shap.summary_plot(vals, Xs_proc, feature_names=use_names, show=False)
+                        shap.summary_plot(vals, Xs_proc, feature_names=use_names, show=False, max_display=20)
                         ax.set_title(f"SHAP summary (class {i})")
                     plt.tight_layout()
-                    plt.savefig(os.path.join(target_dir, "shap_summary.png"), bbox_inches='tight', dpi=150)
+                    plt.savefig(os.path.join(target_dir, "shap_summary.png"), bbox_inches='tight', dpi=150, pad_inches=0.5)
                     plt.close()
             except Exception:
                 # fallback to default single plot
                 try:
-                    plt.figure(figsize=(10, 6))
-                    shap.summary_plot(shap_values, Xs_proc, feature_names=use_names, show=False)
-                    plt.savefig(os.path.join(target_dir, "shap_summary.png"), bbox_inches='tight', dpi=150)
+                    n_features = Xs_proc.shape[1] if hasattr(Xs_proc, 'shape') else 10
+                    fig_height = max(6, n_features * 0.4)
+                    plt.figure(figsize=(12, fig_height))
+                    shap.summary_plot(shap_values, Xs_proc, feature_names=use_names, show=False, max_display=20)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(target_dir, "shap_summary.png"), bbox_inches='tight', dpi=150, pad_inches=0.5)
                     plt.close()
                 except Exception:
                     try:
@@ -1021,15 +1073,18 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
         r = permutation_importance(estimator, X_proc, features_df[label].loc[Xs.index].astype(int) if label in features_df.columns else None, n_repeats=5, random_state=42, n_jobs=-1)
         imp = r.importances_mean
         importances = sorted(zip(Xs.columns if hasattr(Xs,'columns') else list(range(len(imp))), imp), key=lambda x: x[1], reverse=True)
-        # plot
+        # plot with dynamic height
         names = [i[0] for i in importances]
         vals = [i[1] for i in importances]
         import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, max(3, 0.3 * len(names))))
+        fig_height = max(4, len(names) * 0.35)
+        plt.figure(figsize=(12, fig_height))
         sns.barplot(x=vals, y=names, palette="mako")
-        plt.title("Permutation feature importances (fall-back)")
+        plt.title("Permutation Feature Importances", fontsize=14, fontweight='bold', pad=15)
+        plt.xlabel("Importance", fontsize=11, fontweight='bold')
+        plt.ylabel("Feature", fontsize=11, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(os.path.join(target_dir, "permutation_importances.png"), dpi=150)
+        plt.savefig(os.path.join(target_dir, "permutation_importances.png"), dpi=150, bbox_inches='tight', pad_inches=0.3)
         plt.close()
 
     # Also save logistic coefficients if present
@@ -1044,57 +1099,19 @@ def compute_feature_importance_shap(model_path: str, features_df: pd.DataFrame =
             names = Xs.columns if hasattr(Xs, 'columns') else [f"f{i}" for i in range(len(coefs))]
             df_coef = pd.DataFrame({"feature": names, "coef": coefs})
             df_coef = df_coef.reindex(df_coef.coef.abs().sort_values(ascending=False).index)
-            # plot
-            plt.figure(figsize=(10, max(3, 0.3 * len(names))))
+            # plot with dynamic height
+            fig_height = max(4, len(names) * 0.35)
+            plt.figure(figsize=(12, fig_height))
             sns.barplot(x="coef", y="feature", data=df_coef, palette="viridis")
-            plt.title("Model coefficients (absolute values)")
+            plt.title("Model Coefficients", fontsize=14, fontweight='bold', pad=15)
+            plt.xlabel("Coefficient Value", fontsize=11, fontweight='bold')
+            plt.ylabel("Feature", fontsize=11, fontweight='bold')
             plt.tight_layout()
-            plt.savefig(os.path.join(target_dir, "model_coefficients.png"), dpi=150)
+            plt.savefig(os.path.join(target_dir, "model_coefficients.png"), dpi=150, bbox_inches='tight', pad_inches=0.3)
             plt.close()
             df_coef.to_csv(os.path.join(target_dir, "model_coefficients.csv"), index=False)
     except Exception:
         pass
-
-
-def detect_label_leakage(features_df: pd.DataFrame, label: str = "converted", corr_threshold: float = 0.9, sample_frac: float = 0.1) -> Dict[str, Any]:
-    """
-    Detect potential label leakage in feature set. Returns a report (dictionary) with flagged features.
-    Heuristics:
-    - Exact equality with boolean label
-    - High correlation (>corr_threshold)
-    """
-    report = {"flagged": [], "summary": {}}
-    if label not in features_df.columns:
-        raise ValueError("Label column not found")
-    y = features_df[label].astype(int)
-    # Candidate features exclude ids and label
-    exclude = {label, "session_id", "user_id"}
-    candidate_cols = [c for c in features_df.columns if c not in exclude and c != label]
-    # simple checks
-    for col in candidate_cols:
-        ser = features_df[col]
-        reason = []
-        if ser.nunique() == 2:
-            # compare exact equality mapping
-            try:
-                if np.array_equal(ser.astype(int).fillna(0).values, y.values):
-                    reason.append("exact_match_to_label")
-            except Exception:
-                pass
-        # numeric correlation
-        if pd.api.types.is_numeric_dtype(ser):
-            try:
-                corr = abs(ser.fillna(0).astype(float).corr(y))
-                if corr >= corr_threshold:
-                    reason.append(f"high_corr_{corr:.3f}")
-            except Exception:
-                corr = None
-        else:
-            corr = None
-        if len(reason) > 0:
-            report["flagged"].append({"feature": col, "reasons": reason, "corr": corr})
-    report["count_flagged"] = len(report["flagged"])
-    return report
 
 
 def match_orders_to_sessions(orders_path: str, sessions_df: pd.DataFrame, time_window_hours: int = 1, order_by_user: bool = True) -> pd.DataFrame:
@@ -1185,39 +1202,31 @@ if __name__ == "__main__":
     parser.add_argument("--max-rows", type=int, default=None, help="Max rows to read from events.csv (for quick runs)")
     parser.add_argument("--automl-sample-frac", type=float, default=1.0, help="Sample fraction of sessions for AutoML (0-1)")
     parser.add_argument("--train-size", type=float, default=0.8, help="Train fraction of data to use for AutoML; validation will be 1-train-size interval (default 0.8)")
-    parser.add_argument("--drop-leaky-features", action="store_true", help="Drop label-leaky features detected by detect_label_leakage before training")
-    # Note: leak threshold was removed; detect_label_leakage uses its default corr threshold
     parser.add_argument("--skip-automl", action="store_true", help="Skip running AutoML even if PyCaret installed")
     parser.add_argument("--analysis", action="store_true", help="Run additional analysis: leakage detection, model evaluation, SHAP, order matching")
     parser.add_argument("--order-window-hours", type=int, default=1, help="Time window in hours for matching orders to sessions")
     args = parser.parse_args()
 
     print("Reading events and extracting session features. This may take time...")
-    features = extract_sessions(args.events, chunksize=200000, max_rows=args.max_rows)
+    print("Pipeline: Events → Sessions → One-Hot Encoding")
+    features = create_session_features(events_path=args.events, chunksize=200000, max_rows=args.max_rows, apply_encoding=True)
     print("Done. Summary:")
     print(summary_stats(features))
+    print(f"Features extracted with shape: {features.shape}")
+    print(f"Columns: {list(features.columns[:10])}..." if len(features.columns) > 10 else f"Columns: {list(features.columns)}")
     # NOTE: Do not persist the full session features CSV to avoid accidental use of
     # label-derived count columns downstream. The train/validation splits used for
     # modeling will be saved by run_pycaret_automl (train.csv and validation/validation_set*.csv).
-    print("Session-level features extracted (not saved as session_features.csv).")
+    print("Session-level features extracted with one-hot encoding applied.")
 
-    print("Generating visualizations...")
+    print("Generating visualizations from one-hot encoded features...")
     visualize_session_features(features, out_dir=os.path.join(args.output_dir, "figures"))
 
     try:
         if not args.skip_automl:
             print("Running PyCaret AutoML on a sample (this may take a while)...")
-            run_pycaret_automl(features, sample_frac=args.automl_sample_frac, target_dir=os.path.join(args.output_dir, "pycaret"), train_size=args.train_size, drop_leaky_features=args.drop_leaky_features)
+            run_pycaret_automl(features, sample_frac=args.automl_sample_frac, target_dir=os.path.join(args.output_dir, "pycaret"), train_size=args.train_size)
             print("PyCaret finished. Best model saved to outputs/pycaret.")
-            # If training columns were saved, produce a model-specific visualization limited
-            # to the features used for training. Save these in a separate folder.
-            train_cols_path = os.path.join(args.output_dir, "pycaret", "train_columns.json")
-            if os.path.exists(train_cols_path):
-                try:
-                    model_fig_dir = os.path.join(args.output_dir, "figures_model")
-                    visualize_session_features(features, out_dir=model_fig_dir, sample_frac=0.2, train_columns_path=train_cols_path)
-                except Exception:
-                    pass
         else:
             print("Skipping AutoML as requested.")
     except RuntimeError as e:
@@ -1226,12 +1235,6 @@ if __name__ == "__main__":
     if args.analysis:
         analysis_dir = os.path.join(args.output_dir, "analysis")
         os.makedirs(analysis_dir, exist_ok=True)
-        print("Running leakage detection...")
-        leak_report = detect_label_leakage(features)
-        import json
-        with open(os.path.join(analysis_dir, "leak_report.json"), "w") as f:
-            json.dump(leak_report, f, indent=2)
-        print("Saved leak report.")
 
         # Evaluate original saved model (if exists)
         model_path = os.path.join(args.output_dir, "pycaret", "best_pycaret_model")
