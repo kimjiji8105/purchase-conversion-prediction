@@ -1,0 +1,9 @@
+data/processed/
+data/predictions/
+data/raw
+
+outputs/eda/
+outputs/logs/
+
+*.ipynb_checkpoints
+.DS_Store
