@@ -3,3 +3,9 @@ dataset/
 .venv/
 .pytest_cache/
 .DS_Store
+*.log
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+.env
+catboost_info/
